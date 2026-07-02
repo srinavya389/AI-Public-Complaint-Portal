@@ -1,0 +1,128 @@
+import { Router } from "express";
+import { eq, ilike, and, desc } from "drizzle-orm";
+import { db } from "@workspace/db";
+import { complaintsTable, complaintUpdatesTable } from "@workspace/db";
+import {
+  ListComplaintsQueryParams, CreateComplaintBody,
+  UpdateComplaintBody, AddComplaintUpdateBody,
+  GetComplaintParams, UpdateComplaintParams,
+  AddComplaintUpdateParams, AnalyzeComplaintParams,
+} from "@workspace/api-zod";
+import OpenAI from "openai";
+import { requireAuthorityKey } from "../lib/authorityAuth";
+
+const router = Router();
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// GET /complaints — list with filters
+router.get("/complaints", async (req, res) => {
+  const query = ListComplaintsQueryParams.safeParse(req.query);
+  if (!query.success) { res.status(400).json({ error: "Invalid query" }); return; }
+  const { status, category, priority, search } = query.data;
+  const conditions = [];
+  if (status)   conditions.push(eq(complaintsTable.status, status as any));
+  if (category) conditions.push(eq(complaintsTable.category, category));
+  if (priority) conditions.push(eq(complaintsTable.priority, priority as any));
+  if (search)   conditions.push(ilike(complaintsTable.title, `%${search}%`));
+  const complaints = await db.select().from(complaintsTable)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(desc(complaintsTable.createdAt));
+  res.json(complaints);
+});
+
+// POST /complaints — submit new complaint
+router.post("/complaints", async (req, res) => {
+  const body = CreateComplaintBody.safeParse(req.body);
+  if (!body.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const [complaint] = await db.insert(complaintsTable).values({
+    ...body.data,
+    submitterEmail: body.data.submitterEmail ?? null,
+    photoObjectPath: body.data.photoObjectPath ?? null,
+    status: "pending", priority: "medium",
+  }).returning();
+  res.status(201).json(complaint);
+});
+
+// GET /complaints/:id — detail with updates
+router.get("/complaints/:id", async (req, res) => {
+  const { id } = GetComplaintParams.parse({ id: Number(req.params.id) });
+  const [complaint] = await db.select().from(complaintsTable).where(eq(complaintsTable.id, id));
+  if (!complaint) { res.status(404).json({ error: "Not found" }); return; }
+  const updates = await db.select().from(complaintUpdatesTable)
+    .where(eq(complaintUpdatesTable.complaintId, id))
+    .orderBy(desc(complaintUpdatesTable.createdAt));
+  res.json({ ...complaint, updates });
+});
+
+// PATCH /complaints/:id — authority only: update status/priority
+router.patch("/complaints/:id", requireAuthorityKey, async (req, res) => {
+  const { id } = UpdateComplaintParams.parse({ id: Number(req.params.id) });
+  const body = UpdateComplaintBody.safeParse(req.body);
+  if (!body.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const updateData: Record<string, unknown> = { updatedAt: new Date() };
+  if (body.data.status)   updateData.status = body.data.status;
+  if (body.data.priority) updateData.priority = body.data.priority;
+  const [updated] = await db.update(complaintsTable).set(updateData)
+    .where(eq(complaintsTable.id, id)).returning();
+  if (!updated) { res.status(404).json({ error: "Not found" }); return; }
+  res.json(updated);
+});
+
+// POST /complaints/:id/updates — add comment/update
+router.post("/complaints/:id/updates", async (req, res) => {
+  const { id } = AddComplaintUpdateParams.parse({ id: Number(req.params.id) });
+  const body = AddComplaintUpdateBody.safeParse(req.body);
+  if (!body.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const [complaint] = await db.select().from(complaintsTable).where(eq(complaintsTable.id, id));
+  if (!complaint) { res.status(404).json({ error: "Not found" }); return; }
+  const [update] = await db.insert(complaintUpdatesTable).values({
+    complaintId: id, message: body.data.message,
+    authorName: body.data.authorName,
+    authorRole: body.data.authorRole as "citizen" | "authority" | "admin",
+  }).returning();
+  if (body.data.newStatus && body.data.newStatus !== "null") {
+    await db.update(complaintsTable)
+      .set({ status: body.data.newStatus as any, updatedAt: new Date() })
+      .where(eq(complaintsTable.id, id));
+  }
+  res.status(201).json(update);
+});
+
+// POST /complaints/:id/analyze — authority only: GPT-4o vision analysis
+router.post("/complaints/:id/analyze", requireAuthorityKey, async (req, res) => {
+  const { id } = AnalyzeComplaintParams.parse({ id: Number(req.params.id) });
+  const [complaint] = await db.select().from(complaintsTable).where(eq(complaintsTable.id, id));
+  if (!complaint) { res.status(404).json({ error: "Not found" }); return; }
+
+  const systemPrompt = `You are a civic complaint analysis AI. Respond ONLY with JSON:
+{ "analysis": "2-3 sentence professional description", "category": "Pothole|Garbage|Streetlight|Graffiti|Water Leak|Flooding|Noise|Park Maintenance|Traffic Signal|Sidewalk Damage|Other", "severity": "Low|Medium|High|Critical" }`;
+
+  const userContent: OpenAI.Chat.ChatCompletionContentPart[] = [
+    { type: "text", text: `Title: ${complaint.title}\nDescription: ${complaint.description}\nLocation: ${complaint.location}` },
+  ];
+  if (complaint.photoObjectPath) {
+    const domain = process.env.REPLIT_DEV_DOMAIN
+      ? `https://${process.env.REPLIT_DEV_DOMAIN}`
+      : "http://localhost:80";
+    userContent.push({ type: "image_url", image_url: { url: `${domain}/api/storage${complaint.photoObjectPath}`, detail: "auto" } });
+  }
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o", max_tokens: 500,
+    messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
+  });
+
+  let parsed: any = {};
+  try { parsed = JSON.parse(completion.choices[0]?.message?.content ?? "{}"); } catch {}
+  const analysis = parsed.analysis ?? "Unable to analyze";
+  const aiCategory = parsed.category ?? complaint.category;
+  const aiSeverity = parsed.severity ?? "Medium";
+
+  await db.update(complaintsTable)
+    .set({ aiAnalysis: analysis, aiCategory, aiSeverity, updatedAt: new Date() })
+    .where(eq(complaintsTable.id, id));
+
+  res.json({ complaintId: id, analysis, category: aiCategory, severity: aiSeverity });
+});
+
+export default router;
