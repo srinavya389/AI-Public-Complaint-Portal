@@ -1,0 +1,14 @@
+import { Request, Response, NextFunction } from "express";
+
+// Protects privileged routes: status change, AI analysis trigger.
+// Set AUTHORITY_API_KEY env var for production.
+const AUTHORITY_KEY = process.env.AUTHORITY_API_KEY ?? "authority-dev-key-2024";
+
+export function requireAuthorityKey(req: Request, res: Response, next: NextFunction): void {
+  const provided = req.headers["x-authority-key"];
+  if (!provided || provided !== AUTHORITY_KEY) {
+    res.status(403).json({ error: "Forbidden: authority key required" });
+    return;
+  }
+  next();
+}
