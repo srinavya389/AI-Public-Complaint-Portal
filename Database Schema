@@ -1,0 +1,43 @@
+import { pgTable, serial, text, timestamp, pgEnum } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod/v4";
+
+export const statusEnum = pgEnum("complaint_status", [
+  "pending", "under_review", "in_progress", "resolved", "rejected",
+]);
+export const priorityEnum = pgEnum("complaint_priority", [
+  "low", "medium", "high", "critical",
+]);
+export const authorRoleEnum = pgEnum("author_role", [
+  "citizen", "authority", "admin",
+]);
+
+export const complaintsTable = pgTable("complaints", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  description: text("description").notNull(),
+  category: text("category").notNull(),
+  status: statusEnum("status").notNull().default("pending"),
+  priority: priorityEnum("priority").notNull().default("medium"),
+  location: text("location").notNull(),
+  photoObjectPath: text("photo_object_path"),
+  aiAnalysis: text("ai_analysis"),
+  aiCategory: text("ai_category"),
+  aiSeverity: text("ai_severity"),
+  submitterName: text("submitter_name").notNull(),
+  submitterEmail: text("submitter_email"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const complaintUpdatesTable = pgTable("complaint_updates", {
+  id: serial("id").primaryKey(),
+  complaintId: serial("complaint_id").notNull().references(() => complaintsTable.id),
+  message: text("message").notNull(),
+  authorName: text("author_name").notNull(),
+  authorRole: authorRoleEnum("author_role").notNull().default("citizen"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export type Complaint = typeof complaintsTable.$inferSelect;
+export type ComplaintUpdate = typeof complaintUpdatesTable.$inferSelect;
